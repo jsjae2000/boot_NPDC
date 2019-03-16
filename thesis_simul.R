@@ -1,3 +1,9 @@
+### final update : 20190316
+### considerations : 
+### - add function MNQLE_ABoot_step and MNQLE_onestep_cal
+### - no discrete covariates except lagged variables
+### - 1 lagged variable
+
 # 1. settings ----------------------------------------------------------------
 ## library
 library(dplyr)
@@ -12,6 +18,16 @@ f1 <- function(x, y_1) {
   beta2 <- .5
   
   out <- beta0 + beta1*x + beta2 * y_1
+  out <- unname(out)
+  return(out)
+}
+
+f2 <- function(x, y_1) {
+  beta0 <- -.2
+  beta1 <- -1.75
+  beta2 <- 2
+  
+  out <- beta0 + sin(beta1*x + beta2*y_1)
   out <- unname(out)
   return(out)
 }
@@ -127,12 +143,12 @@ MNQLE_est <- function(X, Y, d_lag, point, bw, link_ftn = "probit", V_ftn = "bino
   
   i_conti <- match(attr(df_lag, "conti_str"), names(df_lag)[-1])
   i_disc <- match(attr(df_lag, "disc_str"), names(df_lag)[-1])
-  x_est <- point[i_conti]
-  z_est <- point[i_disc]
+  x_pt <- point[i_conti]
+  z_pt <- point[i_disc]
   x_bw <- bw[i_conti]
   z_bw <- bw[i_disc]
   
-  return(MNQLE_optimize(x_est, z_est, x_bw, z_bw, ftns, df_lag, method, init, tolerance, max_iter))
+  return(MNQLE_optimize(x_pt, z_pt, x_bw, z_bw, ftns, df_lag, method, init, tolerance, max_iter))
 }
 
 MNQLE_train <- function(X, Y, d_lag, bw, link_ftn = "probit", V_ftn = "binomial", method = "NR", init = NULL, tolerance = 1e-05, max_iter = 1000, verbose = TRUE) {
@@ -151,6 +167,7 @@ MNQLE_train <- function(X, Y, d_lag, bw, link_ftn = "probit", V_ftn = "binomial"
     init = NULL
     tolerance = 1e-05
     max_iter = 1000
+    verbose = TRUE
   }
   ### TO execute autoregressive bootstrap,
   ### generate df_train object which consits of columns all continuous 
@@ -173,19 +190,26 @@ MNQLE_train <- function(X, Y, d_lag, bw, link_ftn = "probit", V_ftn = "binomial"
       envhere <- environment()
       pb <- txtProgressBar(min = 0, max = nrow(df_lag) * nrow(lagresp), style = 3, width = 50)
     }
-    train_model <- apply(lagresp,
-                         1,
-                         function(lagresp_value) {
-                           apply(df_lag, 1, function(x_value) {
-                             disc_value <- x_value["resp__lagged__" %++% 1:d_lag] <- lagresp_value
-                             est_value <- MNQLE_optimize(x_value[attr(df_lag, "conti_str")],
-                                                         disc_value, 
-                                                         x_bw, z_bw, ftns, df_lag, method, init, tolerance, max_iter)
-                             assign("i_verbose", i_verbose + 1, envhere)
-                             if (verbose) setTxtProgressBar(pb, i_verbose)
-                             return(est_value)
-                           })
-                         })
+    
+    train_model <- lapply(1:nrow(lagresp), 
+                          function(i_lagresp) {
+                            lagresp_value <- unlist(lagresp[i_lagresp, ])
+                            apply(df_lag, 
+                                  1,
+                                  function(x_value) {
+                                    est_value <- MNQLE_optimize(x_value[attr(df_lag, "conti_str")],
+                                                                lagresp_value, 
+                                                                x_bw, z_bw, ftns, df_lag, method, init, tolerance, max_iter)
+                                    if (verbose) {
+                                      assign("i_verbose", i_verbose + 1, envhere)
+                                      setTxtProgressBar(pb, i_verbose)
+                                    }
+                                    return(c(mean = est_value$mean, est_value$reg))
+                                  }) %>%
+                              t() %>%
+                              as.data.frame()
+                          })
+    
     attr(train_model, "df_lagresp") <- lagresp
   } else {
     stop("under construction")
@@ -197,8 +221,8 @@ MNQLE_train <- function(X, Y, d_lag, bw, link_ftn = "probit", V_ftn = "binomial"
   return(train_model)
 }
 
-MNQLE_bootstrap_AR <- function(n_boot = 500, train_model, point, bw, link_ftn = "probit", V_ftn = "binomial", 
-                               method = "NR", init = NULL, tolerance = 1e-05, max_iter = 1000, save_sample = TRUE, verbose = TRUE) {
+MNQLE_ABoot <- function(n_boot = 500, train_model, point, bw, link_ftn = "probit", V_ftn = "binomial", 
+                        method = "NR", init = NULL, tolerance = 1e-05, max_iter = 1000, save_sample = TRUE, verbose = TRUE) {
   if (FALSE) {
     n_boot <- 500
     train_model <- MNQLE_tr
@@ -227,8 +251,8 @@ MNQLE_bootstrap_AR <- function(n_boot = 500, train_model, point, bw, link_ftn = 
   
   i_conti <- match(attr(df_lag, "conti_str"), names(df_lag)[-1])
   i_disc <- match(attr(df_lag, "disc_str"), names(df_lag)[-1])
-  x_est <- point[i_conti]
-  z_est <- point[i_disc]
+  x_pt <- point[i_conti]
+  z_pt <- point[i_disc]
   x_bw <- bw[i_conti]
   z_bw <- bw[i_disc]
   
@@ -268,8 +292,79 @@ MNQLE_bootstrap_AR <- function(n_boot = 500, train_model, point, bw, link_ftn = 
   return(est_boot)
 }
 
-MNQLE_bootstrap_reg <- function(n_boot = 500, X, Y, estimates, d_lag, point, bw, link_ftn = "probit", V_ftn = "binomial", 
-                                method = "NR", init = NULL, tolerance = 1e-05, max_iter = 1000, save_sample = TRUE, verbose = TRUE) {
+##### function to generate Autoregression Bootstrap samples and estimators using one-step approximation
+MNQLE_ABoot_step <- function(n_boot = 500, train_model, point, save_sample = TRUE, verbose = TRUE) {
+  if (FALSE) {
+    point <- c(1, 1)
+    n_boot <- 500
+    train_model <- MNQLE_tr
+    save_sample = TRUE
+    verbose = TRUE
+  }
+  
+  ### defining and preprocessing ###
+  X <- attr(train_model, "model")$X
+  Y <- attr(train_model, "model")$Y
+  d_lag <- attr(train_model, "model")$d_lag
+  if (d_lag == 0) stop("use function for regression bootstrap")
+  
+  df_lag <- cmn_preproc(X, Y, d_lag)
+  ftns <- cmn_defftns(attr(train_model, "model")$link_ftn, attr(train_model, "model")$V_ftn)
+  
+  i_conti <- match(attr(df_lag, "conti_str"), names(df_lag)[-1])
+  i_disc <- match(attr(df_lag, "disc_str"), names(df_lag)[-1])
+  x_pt <- point[i_conti]
+  z_pt <- point[i_disc]
+  
+  bw <- attr(train_model, "model")$bw
+  x_bw <- bw[i_conti]
+  z_bw <- bw[i_disc]
+  
+  ### estimation at point ###
+  model_ <- attr(train_model, "model")
+  model_$point <- point
+  f_hat <- do.call(MNQLE_est, model_)$reg
+  
+  ### bootstrap ###
+  # calculate necessary index to calculate bootstrap samples to estimate at point
+  df_conti <- df_lag[attr(df_lag, "conti_str")]
+  i_calboot <- 1
+  for (i in 1:ncol(df_conti)) {
+    i_calboot <- max(i_calboot, max(which((df_conti[, i] <= x_est[i] + x_bw[i]) & (df_conti[, i] >= x_est[i] - x_bw[i]))))
+  }
+  
+  # prepare to save bootstrap samples
+  if (save_sample) boot_sample <- matrix(NA_integer_, nrow = i_calboot + d_lag, ncol = n_boot)
+  if (verbose) pb <- txtProgressBar(min = 0, max = n_boot, style = 3, width = 50)
+  
+  est_boot <- c()
+  for (i_boot in 1:n_boot) {
+    Y_boot <- attr(df_lag, "head")[["resp__var__"]]
+    lagresp_value <- Y_boot
+    for (i_df in 1:i_calboot) {
+      # generate bootstrap sample
+      #lagresp_value <- rev(tail(Y_boot, d_lag))
+      i_lagresp <- which(apply(attr(train_model, "df_lagresp"), 1, function(x) x == lagresp_value))
+      Y_boot_1 <- rbinom(1, 1, train_model[[i_lagresp]][i_df, 1])
+      lagresp_value <- c(lagresp_value[-1], Y_boot_1)
+      Y_boot <- c(Y_boot, Y_boot_1)
+    }
+    
+    if (save_sample) boot_sample[, i_boot] <- Y_boot
+    
+    # calculate bootstrap estimates
+    df_lag_boot <- cmn_preproc(X[1:(i_calboot + d_lag),,drop = FALSE], Y_boot, d_lag)
+    
+    # print if verbose == TURE
+    if (verbose) setTxtProgressBar(pb, i_boot)
+  }
+  
+  if (save_sample) attr(est_boot, "samples") <- boot_sample
+  return(est_boot)
+}
+
+MNQLE_RBoot <- function(n_boot = 500, X, Y, estimates, d_lag, point, bw, link_ftn = "probit", V_ftn = "binomial", 
+                        method = "NR", init = NULL, tolerance = 1e-05, max_iter = 1000, save_sample = TRUE, verbose = TRUE) {
   if (FALSE) {
     estimates <- df_simul$est
     
@@ -296,8 +391,8 @@ MNQLE_bootstrap_reg <- function(n_boot = 500, X, Y, estimates, d_lag, point, bw,
   
   i_conti <- match(attr(df_lag, "conti_str"), names(df_lag)[-1])
   i_disc <- match(attr(df_lag, "disc_str"), names(df_lag)[-1])
-  x_est <- point[i_conti]
-  z_est <- point[i_disc]
+  x_pt <- point[i_conti]
+  z_pt <- point[i_disc]
   x_bw <- bw[i_conti]
   z_bw <- bw[i_disc]
   
@@ -359,8 +454,8 @@ MNQLE_bootstrap_coverage <- function(n_boot = 500, X, Y, estimates, d_lag, point
   
   i_conti <- match(attr(df_lag, "conti_str"), names(df_lag)[-1])
   i_disc <- match(attr(df_lag, "disc_str"), names(df_lag)[-1])
-  x_est <- point[i_conti]
-  z_est <- point[i_disc]
+  x_pt <- point[i_conti]
+  z_pt <- point[i_disc]
   x_bw <- bw[i_conti]
   z_bw <- bw[i_disc]
   
@@ -421,14 +516,15 @@ MNQLE_optimize <- function(x_est, z_est, x_bw, z_bw, ftns, df_lag, method = "NR"
     }
   }
   
-  return(ginv(f_new[1]))
+  
+  return(list(mean = ftns$ginv(f_new[1]), reg = f_new[, 1]))
 }
 
 MNQLE_NR_calculate <- function(f_at, x_est, z_est, x_bw, z_bw, ftns, df_lag) {
   if (FALSE) {
     f_at = f_old
-    x_est = point[1:length(conti_str)]
-    z_est = point[-(1:length(conti_str))] 
+    x_pt = point[1:length(conti_str)]
+    z_pt = point[-(1:length(conti_str))] 
     x_bw = bw[1:length(conti_str)]
     z_bw = bw[-(1:length(conti_str))]
     ftns = ftns
@@ -472,6 +568,76 @@ MNQLE_NR_calculate <- function(f_at, x_est, z_est, x_bw, z_bw, ftns, df_lag) {
   return(list(eq1 = matrix(eq1_val, ncol = 1), eq2 = eq2_val))
 }
 
+MNQLE_onestep_cal1 <- function(f_hat, x_est, z_est, x_bw, z_bw, ftns, df_lag) {
+  conti_str <- attr(df_lag, "conti_str")
+  disc_str <- attr(df_lag, "disc_str")
+  
+  wci_all <- x_kern(x_bw, x_est, df_lag[conti_str])
+  cal_ind <- wci_all != 0
+  
+  # From here, all objects are reduced using cal_ind
+  df_cal <- df_lag_boot[cal_ind, ]
+  wci <- wci_all[cal_ind]
+  wdi <- z_kern(z_bw, z_est, df_cal[disc_str])
+  mi_hat <- ftns$ginv(data.matrix(sweep(df_cal[conti_str], 2, x_est)) %*%
+                        matrix(f_hat[-1], ncol = 1) +
+                        f_hat[1]
+  )[, 1]
+  mi_hat[mi_hat >= 1 - 1e-05] <- 1 - 1e-05
+  mi_hat[mi_hat <= 1e-05] <- 1e-05
+  
+  ### calculate D_hat ###
+  Wi <- cbind(intercept = 1, sweep(df_cal[conti_str], 2, x_est) %>% sweep(2, FUN = "/", x_bw)) %>%
+    as.matrix()
+  pre_Wi <- wci * wdi / (ftns$Veval(mi_hat) * ftns$gprime(mi_hat)^2) # constants for calculating hat_D
+  nD_hat <- (sweep(t(Wi), 2, pre_Wi, FUN = "*") %*% Wi)  # n * hat_D
+  
+  return(nD_hat)
+}
+
+MNQLE_onestep_cal1 <- function(f_hat, x_est, z_est, x_bw, z_bw, ftns, df_lag_boot) {
+  conti_str <- attr(df_lag_boot, "conti_str")
+  disc_str <- attr(df_lag_boot, "disc_str")
+  
+  wci_all <- x_kern(x_bw, x_est, df_lag_boot[conti_str])
+  cal_ind <- wci_all != 0
+  
+  # From here, all objects are reduced using cal_ind
+  df_cal <- df_lag_boot[cal_ind, ]
+  wci <- wci_all[cal_ind]
+  wdi <- z_kern(z_bw, z_est, df_cal[disc_str])
+  mi_hat <- ftns$ginv(data.matrix(sweep(df_cal[conti_str], 2, x_est)) %*%
+                        matrix(f_hat[-1], ncol = 1) +
+                        f_hat[1]
+  )[, 1]
+  mi_hat[mi_hat >= 1 - 1e-05] <- 1 - 1e-05
+  mi_hat[mi_hat <= 1e-05] <- 1e-05
+  
+  ### calculate D_hat ###
+  Wi <- cbind(intercept = 1, sweep(df_cal[conti_str], 2, x_est) %>% sweep(2, FUN = "/", x_bw)) %>%
+    as.matrix()
+  
+  q1i <- (df_cal[, 1] - mi_hat) / (ftns$Veval(mi) * ftns$gprime(mi))
+  product1_i <- matrix(wci * wdi * q1i, nrow = 1)
+  # dim(Wi) = n X d
+  
+  # eq1_val
+  eq1_val <- (product1_i %*% Wi) / nrow(df_lag)
+  
+  ### calculate eq2 val ###
+  q2i_tmp11 <- ftns$Vprime(mi) / (ftns$Veval(mi) * (ftns$gprime(mi)^2))
+  q2i_tmp12 <- ftns$gprime2(mi) / (ftns$gprime(mi))^3
+  q2i_tmp1 <- ftns$Veval(mi) / (q2i_tmp11 + q2i_tmp12)
+  q2i_tmp2 <- ftns$Veval(mi) * ftns$gprime(mi)^2; q2i_tmp2 <- 1 / q2i_tmp2
+  q2i <- -(df_cal[, 1] - mi) / q2i_tmp1 - q2i_tmp2
+  
+  product2_i <- matrix(wci * wdi * q2i, nrow = 1)
+  
+  eq2_val <- (sweep(t(Wi), 2, product2_i, FUN = "*") %*% Wi) / nrow(df_lag)
+  
+  return(list(eq1 = matrix(eq1_val, ncol = 1), eq2 = eq2_val))
+}
+
 plot.progress <- function(...)	{
   vectOfBar <- c(...)*100
   numOfBar <- length(vectOfBar)
@@ -485,26 +651,64 @@ plot.progress <- function(...)	{
 
 # 2. generate data -----------------------------------------------------------
 set.seed(111)
-## 2-1. Example 1 ----------------------------------------------------------
+if (FALSE) {
+  ## 2-1. Example 1 ----------------------------------------------------------
+  n <- 501
+  y_init <- 0
+  x_bd <- c(-3, 3)
+  link_ftn <- "probit"
+  if (link_ftn == "probit") {
+    ginv <- pnorm
+    gprime <- function(x) 1 / dnorm(qnorm(x))
+    gprime2 <- function(x) (x * dnorm(qnorm(x))) * (dnorm(x)) / (dnorm(qnorm(x)))^2
+  }
+  
+  V_ftn <- "binomial"
+  
+  y_vec <- c("0" = y_init)
+  mean_vec <- double()
+  x_vec = runif(n, min = x_bd[1], max = x_bd[2])
+  for (i in 1:n) {
+    mean_val <- f1(x_vec[i], 
+                   y_vec[as.character(i-1)]) %>%
+      ginv
+    mean_vec <- c(mean_vec, mean_val)
+    y_vec <- c(y_vec, rbinom(1, 1, mean_val))
+    names(y_vec)[length(y_vec)] <- as.character(i)
+  }
+  
+  df_simul <- data.frame(x_1 = x_vec, 
+                         z_1 = y_vec[-length(y_vec)],
+                         y = y_vec[as.character(1:n)], 
+                         mean = mean_vec)
+  df_analysis <- df_simul %>%
+    select(x_1, y)
+  
+  # check
+  plot(df_simul$x_1,
+       df_simul$mean, 
+       col = df_simul$z_1 + 1)
+}
+
+
+
+## 2-1. Example 2 ----------------------------------------------------------
+# settings 
 n <- 501
 y_init <- 0
 x_bd <- c(-3, 3)
-link_ftn <- "probit"
-if (link_ftn == "probit") {
-  ginv <- pnorm
-  gprime <- function(x) 1 / dnorm(qnorm(x))
-  gprime2 <- function(x) (x * dnorm(qnorm(x))) * (dnorm(x)) / (dnorm(qnorm(x)))^2
-}
+list_ftns <- cmn_defftns("probit", "binomial")
+reg_ftn <- f2
 
-V_ftn <- "binomial"
-
+# start generating
 y_vec <- c("0" = y_init)
 mean_vec <- double()
 x_vec = runif(n, min = x_bd[1], max = x_bd[2])
+
 for (i in 1:n) {
-  mean_val <- f1(x_vec[i], 
-                 y_vec[as.character(i-1)]) %>%
-    ginv
+  mean_val <- reg_ftn(x_vec[i], 
+                      y_vec[as.character(i-1)]) %>%
+    (list_ftns$ginv)
   mean_vec <- c(mean_vec, mean_val)
   y_vec <- c(y_vec, rbinom(1, 1, mean_val))
   names(y_vec)[length(y_vec)] <- as.character(i)
@@ -526,12 +730,13 @@ plot(df_simul$x_1,
 
 # 3. Estimation -----------------------------------------------------------
 ## inpt : define now
-df_simul <- expand.grid(x = -2:2, z = 0:1)
-df_simul$mean <- NA
-for (i in 1:nrow(df_simul)) {
-  df_simul$mean[i] <- f1(df_simul$x[i], df_simul$z[i]) %>%
-    ginv
-}
+reg_ftn <- f2 
+# df_simul <- expand.grid(x = -2:2, z = 0:1)
+# df_simul$mean <- NA
+# for (i in 1:nrow(df_simul)) {
+#   df_simul$mean[i] <- mean_ftn(df_simul$x[i], df_simul$z[i]) %>%
+#     ginv
+# }
 
 conti_str <- c("x_1")
 disc_str <- character(0)
@@ -548,7 +753,7 @@ for (ii in 1:nrow(df_simul)) {
               Y = df_analysis$y,
               d_lag = 1,
               point = c(df_simul[ii, "x_1"], df_simul[ii, "z_1"]),
-              bw = c(x_bw_init, z_bw_init))
+              bw = c(x_bw_init, z_bw_init))$mean
   setTxtProgressBar(pb_est, ii)
 }
 
